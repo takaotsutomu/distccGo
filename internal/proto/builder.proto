@@ -1,0 +1,92 @@
+syntax = "proto3";
+package builder;
+
+option go_package = "github.com/takaotsutomu/distccGo/internal/proto";
+
+service BuildService {
+  // Submit a compilation job
+  rpc SubmitCompileJob(CompileJobRequest) returns (CompileJobResponse) {}
+
+  // Submit a linking job
+  rpc SubmitLinkJob(LinkJobRequest) returns (LinkJobResponse) {}
+
+  // Stream for workers to receive jobs
+  rpc WorkerStream(WorkerRegistration) returns (stream JobRequest) {}
+
+  // Report job completion status
+  rpc ReportJobStatus(JobStatusReport) returns (JobStatusAck) {}
+
+  // Get the status of a job
+  rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse) {}
+}
+
+// JobRequest is a union type for all job types
+message JobRequest {
+  oneof job {
+    CompileJobRequest compile_job = 1;
+    LinkJobRequest link_job = 2;
+  }
+}
+
+message CompileJobRequest {
+  string source_file = 1;
+  string output_file = 2;
+  string compiler = 3;
+  repeated string args = 4;
+  string working_dir = 5;
+  string job_id = 6;
+  repeated string dependency_files = 7;
+}
+
+message LinkJobRequest {
+  string output_file = 1;         // The target binary/library to produce
+  string linker = 2;              // The linker executable (e.g., ld, gold, lld)
+  repeated string input_files = 3; // Object files and libraries to link
+  repeated string args = 4;        // Linker arguments
+  string working_dir = 5;
+  string job_id = 6;
+  int32 priority = 7;             // Higher priority for link jobs (they're often on the critical path)
+}
+
+message CompileJobResponse {
+  string job_id = 1;
+  bool accepted = 2;
+  string message = 3;
+}
+
+message LinkJobResponse {
+  string job_id = 1;
+  bool accepted = 2;
+  string message = 3;
+}
+
+message WorkerRegistration {
+  string worker_id = 1;
+  int32 max_jobs = 2;
+  repeated string supported_compilers = 3;
+  repeated string supported_linkers = 4;  // Linkers this worker supports
+  bool supports_linking = 5;              // Whether this worker can handle link jobs
+  int32 memory_mb = 6;                    // Available memory (useful for large link jobs)
+}
+
+message JobStatusReport {
+  string job_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  string worker_id = 4;
+  int64 execution_time_ms = 5;
+  bool is_link_job = 6;                  // Whether this was a link job
+}
+
+message JobStatusAck { bool received = 1; }
+
+message JobStatusRequest { string job_id = 1; }
+
+message JobStatusResponse {
+  string job_id = 1;
+  string status = 2; // "pending", "assigned", "running", "completed", "failed"
+  string error_message = 3;
+  string worker_id = 4;
+  int64 elapsed_time_ms = 5;
+  bool is_link_job = 6;
+}
