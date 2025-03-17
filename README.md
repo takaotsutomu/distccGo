@@ -56,12 +56,26 @@ To start a worker that only processes compilation jobs (no linking):
 ./bin/distcc-go --worker --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs --max-jobs=8 --disable-linking
 ```
 
+To configure worker directory tracking for locality-aware scheduling:
+
+```bash
+./bin/distcc-go --worker --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs --max-jobs=8 \
+  --max-dirs-tracked=200 --dir-report-interval=3m
+```
+
 ### Using the Compiler Launcher
 
 Use the launcher as a compiler wrapper:
 
 ```bash
 ./bin/distcc-go --compiler --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs -- g++ -c main.cpp -o main.o
+```
+
+With job batching enabled:
+
+```bash
+./bin/distcc-go --compiler --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs \
+  --batch-size=20 --batch-timeout=500ms -- g++ -c main.cpp -o main.o
 ```
 
 ### Using the Linker Launcher
@@ -72,16 +86,45 @@ Use the launcher as a linker wrapper:
 ./bin/distcc-go --linker --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs -- g++ -o myapp main.o utils.o -lm
 ```
 
+With job batching enabled:
+
+```bash
+./bin/distcc-go --linker --server-addr=server-hostname:50051 --fs-mount=/mnt/cephfs \
+  --batch-size=5 --batch-timeout=1s -- g++ -o myapp main.o utils.o -lm
+```
+
+### Command-Line Options
+
+#### Common Options
+
+- `--server-addr=STRING`: Build server address (default: "localhost:50051")
+- `--fs-mount=STRING`: Path to the shared filesystem mount point (default: "/mnt/cephfs")
+- `--build-dir=STRING`: Path to the build directory (root of build outputs)
+
+#### Worker Options
+
+- `--max-jobs=INT`: Maximum parallel jobs for worker (default: 4)
+- `--disable-linking`: Disable linking support for this worker
+- `--max-dirs-tracked=INT`: Maximum number of directories to track per worker (default: 100)
+- `--dir-report-interval=DURATION`: Interval for reporting directory statistics (default: 5m)
+
+#### Compiler/Linker Options
+
+- `--batch-size=INT`: Number of jobs to batch together (default: 1, no batching)
+- `--batch-timeout=DURATION`: Maximum time to wait for a batch to fill (default: 500ms)
+
 ### Integration with CMake
 
 Add this to your CMake configuration to use distccGo:
 
 ```cmake
 # For compilation
-set(CMAKE_CXX_COMPILER_LAUNCHER "/path/to/bin/distcc-go" "--compiler" "--server-addr=server-hostname:50051" "--fs-mount=/mnt/cephfs" "--build-dir=${BUILD_DIR}" "--")
+set(CMAKE_CXX_COMPILER_LAUNCHER "/path/to/bin/distcc-go" "--compiler" "--server-addr=server-hostname:50051" "--fs-mount=/mnt/cephfs" 
+"--build-dir=${BUILD_DIR}" "--batch-size=20" "--batch-timeout=500ms" "--")
 
 # For linking (CMake 3.21+)
-set(CMAKE_CXX_LINKER_LAUNCHER "/path/to/bin/distcc-go" "--linker" "--server-addr=server-hostname:50051" "--fs-mount=/mnt/cephfs" "--build-dir=${BUILD_DIR}" "--")
+set(CMAKE_CXX_LINKER_LAUNCHER "/path/to/bin/distcc-go" "--linker" "--server-addr=server-hostname:50051" "--fs-mount=/mnt/cephfs" 
+"--build-dir=${BUILD_DIR}" "--batch-size=5" "--batch-timeout=1s" "--")
 ```
 
 ## How It Works
@@ -113,3 +156,4 @@ The system is designed to be fault-tolerant:
 - **Scalability**: Easy to add more worker nodes without configuration changes
 - **Reliability**: Jobs are automatically reassigned if a worker fails
 - **Completeness**: Distributes both compilation and linking, maximizing parallelism
+- **Performance**: Job batching and locality-aware scheduling improve throughput and efficiency

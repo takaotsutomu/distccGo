@@ -40,6 +40,13 @@ type Worker struct {
 	activeJobsLock sync.Mutex
 	jobMapLock     sync.Mutex
 	jobMap         map[string]*JobInfo
+
+	// Directory tracking for locality-aware scheduling
+	recentDirs        map[string]time.Time
+	recentDirsLock    sync.RWMutex
+	maxDirsTracked    int
+	dirReportTicker   *time.Ticker
+	dirReportInterval time.Duration
 }
 
 // JobInfo tracks information about a currently processing job
@@ -54,17 +61,20 @@ type JobInfo struct {
 // NewWorker creates a new worker instance with automatic resource detection
 func NewWorker(serverAddr, fsMount string, maxJobs int32) *Worker {
 	return &Worker{
-		id:              uuid.New().String(),
-		maxJobs:         maxJobs,
-		serverAddress:   serverAddr,
-		fsMountPoint:    fsMount,
-		compilers:       GetAvailableCompilers(),
-		linkers:         GetAvailableLinkers(),
-		supportsLinking: true, // Enable by default
-		memoryMB:        GetAvailableMemory(),
-		cpuCount:        int32(runtime.NumCPU()),
-		activeJobs:      0,
-		jobMap:          make(map[string]*JobInfo),
+		id:                uuid.New().String(),
+		maxJobs:           maxJobs,
+		serverAddress:     serverAddr,
+		fsMountPoint:      fsMount,
+		compilers:         getAvailableCompilers(),
+		linkers:           getAvailableLinkers(),
+		supportsLinking:   true, // Enable by default
+		memoryMB:          getAvailableMemory(),
+		cpuCount:          int32(runtime.NumCPU()),
+		activeJobs:        0,
+		jobMap:            make(map[string]*JobInfo),
+		recentDirs:        make(map[string]time.Time),
+		maxDirsTracked:    100,             // Default: track up to 100 directories
+		dirReportInterval: 5 * time.Minute, // Default: report every 5 minutes
 	}
 }
 
@@ -74,6 +84,18 @@ func (w *Worker) SetSupportsLinking(supports bool) {
 	if !supports {
 		log.Println("Linking support has been disabled")
 	}
+}
+
+// SetDirectoryTrackingParams configures directory tracking parameters
+func (w *Worker) SetDirectoryTrackingParams(maxDirs int, reportInterval time.Duration) {
+	w.recentDirsLock.Lock()
+	defer w.recentDirsLock.Unlock()
+
+	w.maxDirsTracked = maxDirs
+	w.dirReportInterval = reportInterval
+
+	log.Printf("Directory tracking configured: max dirs: %d, report interval: %v",
+		maxDirs, reportInterval)
 }
 
 // Connect establishes a connection to the build server
@@ -106,6 +128,13 @@ func (w *Worker) Start(ctx context.Context) error {
 		log.Printf("Worker does NOT support linking")
 	}
 
+	// Start directory reporting ticker
+	w.dirReportTicker = time.NewTicker(w.dirReportInterval)
+	defer w.dirReportTicker.Stop()
+
+	// Start directory reporting in a goroutine
+	go w.startDirectoryReporting(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -115,6 +144,9 @@ func (w *Worker) Start(ctx context.Context) error {
 			// Continue processing
 		}
 
+		// Get directories for registration
+		recentDirs := w.getRecentDirectories()
+
 		// Register with server and create job stream
 		stream, err := w.client.WorkerStream(ctx, &pb.WorkerRegistration{
 			WorkerId:           w.id,
@@ -123,6 +155,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			SupportedLinkers:   w.linkers,
 			SupportsLinking:    w.supportsLinking,
 			MemoryMb:           w.memoryMB,
+			RecentDirectories:  recentDirs,
 		})
 
 		if err != nil {
@@ -131,7 +164,8 @@ func (w *Worker) Start(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("Connected to server %s, waiting for jobs", w.serverAddress)
+		log.Printf("Connected to server %s, registered %d directories, waiting for jobs",
+			w.serverAddress, len(recentDirs))
 
 		// Process jobs as they arrive
 		for {
@@ -218,6 +252,11 @@ func (w *Worker) Start(ctx context.Context) error {
 func (w *Worker) Close() error {
 	log.Println("Worker shutting down, waiting for jobs to complete...")
 
+	// Stop directory reporting ticker if it exists
+	if w.dirReportTicker != nil {
+		w.dirReportTicker.Stop()
+	}
+
 	// Cancel all running jobs
 	w.jobMapLock.Lock()
 	numJobs := len(w.jobMap)
@@ -241,22 +280,115 @@ func (w *Worker) Close() error {
 		log.Printf("Timeout waiting for %d jobs to complete", numJobs)
 	}
 
+	// Final directory report
+	w.reportDirectories()
+
 	if w.conn != nil {
 		return w.conn.Close()
 	}
 	return nil
 }
 
+// startDirectoryReporting periodically reports directories to the server
+func (w *Worker) startDirectoryReporting(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.dirReportTicker.C:
+			w.reportDirectories()
+		}
+	}
+}
+
+// reportDirectories sends a directory update to the server
+func (w *Worker) reportDirectories() {
+	dirs := w.getRecentDirectories()
+
+	if len(dirs) == 0 {
+		return // No directories to report
+	}
+
+	// Send directory update to server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := w.client.UpdateDirectories(ctx, &pb.DirectoryUpdateRequest{
+		WorkerId:    w.id,
+		Directories: dirs,
+	})
+
+	if err != nil {
+		log.Printf("Failed to update directories: %v", err)
+	} else {
+		log.Printf("Reported %d recent directories to server", len(dirs))
+	}
+}
+
+// getRecentDirectories returns a list of recently accessed directories
+func (w *Worker) getRecentDirectories() []string {
+	w.recentDirsLock.RLock()
+	defer w.recentDirsLock.RUnlock()
+
+	// Only return directories that are less than 1 hour old
+	now := time.Now()
+	dirs := make([]string, 0, len(w.recentDirs))
+
+	for dir, timestamp := range w.recentDirs {
+		if now.Sub(timestamp) < time.Hour {
+			dirs = append(dirs, dir)
+		}
+	}
+
+	return dirs
+}
+
+// trackDirectory records a directory access for locality tracking
+func (w *Worker) trackDirectory(path string) {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		return
+	}
+
+	// Normalize directory path
+	dir = filepath.Clean(dir)
+
+	w.recentDirsLock.Lock()
+	defer w.recentDirsLock.Unlock()
+
+	// Store or update timestamp for this directory
+	w.recentDirs[dir] = time.Now()
+
+	// Limit map size (remove oldest entries if needed)
+	if len(w.recentDirs) > w.maxDirsTracked {
+		var oldestDir string
+		var oldestTime time.Time
+
+		first := true
+		for d, t := range w.recentDirs {
+			if first || t.Before(oldestTime) {
+				oldestDir = d
+				oldestTime = t
+				first = false
+			}
+		}
+
+		if oldestDir != "" {
+			delete(w.recentDirs, oldestDir)
+		}
+	}
+}
+
 // normalizeAndCheckPath ensures paths are properly handled with mount points
 func (w *Worker) normalizeAndCheckPath(path string) string {
 	// First normalize the path to remove extra slashes and resolve . and .. segments
 	normalizedPath := filepath.Clean(path)
-	
+
 	// If path is already absolute and contains the mount point, use it as-is
 	if filepath.IsAbs(normalizedPath) && strings.HasPrefix(normalizedPath, w.fsMountPoint) {
 		return normalizedPath
 	}
-	
+
 	// If path is absolute but doesn't contain the mount point
 	if filepath.IsAbs(normalizedPath) {
 		// Check if this is a system path that should remain unchanged
@@ -266,13 +398,13 @@ func (w *Worker) normalizeAndCheckPath(path string) string {
 				return normalizedPath
 			}
 		}
-		
+
 		// For non-system absolute paths, convert them to be relative to the mount point
 		relativePath := strings.TrimPrefix(normalizedPath, "/")
 		mappedPath := filepath.Join(w.fsMountPoint, relativePath)
 		return mappedPath
 	}
-	
+
 	// For relative paths, join with the mount point
 	return filepath.Join(w.fsMountPoint, normalizedPath)
 }
@@ -321,6 +453,13 @@ func (w *Worker) processCompileJob(parentCtx context.Context, job *pb.CompileJob
 	} else {
 		// If output is relative, keep it relative to the working directory
 		outputFile = job.OutputFile
+	}
+
+	// Track directories for locality-aware scheduling
+	w.trackDirectory(sourceFile)
+	w.trackDirectory(workingDir)
+	if filepath.IsAbs(job.OutputFile) {
+		w.trackDirectory(outputFile)
 	}
 
 	// Make sure the working directory exists
@@ -453,6 +592,17 @@ func (w *Worker) processLinkJob(parentCtx context.Context, job *pb.LinkJobReques
 		} else {
 			// Keep relative paths as they are
 			normalizedInputFiles[i] = inputFile
+		}
+	}
+
+	// Track directories for locality-aware scheduling
+	w.trackDirectory(workingDir)
+	if filepath.IsAbs(job.OutputFile) {
+		w.trackDirectory(outputFile)
+	}
+	for _, inputFile := range normalizedInputFiles {
+		if filepath.IsAbs(inputFile) {
+			w.trackDirectory(inputFile)
 		}
 	}
 

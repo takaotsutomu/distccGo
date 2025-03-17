@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/takaotsutomu/distccGo/internal/compiler"
 	"github.com/takaotsutomu/distccGo/internal/server"
@@ -36,6 +37,14 @@ func main() {
 	maxJobs := flag.Int("max-jobs", 4, "Maximum parallel jobs for worker")
 	disableLinking := flag.Bool("disable-linking", false, "Disable linking support for this worker")
 
+	// Job batching parameters
+	batchSize := flag.Int("batch-size", 1, "Number of jobs to batch together (1 = no batching)")
+	batchTimeout := flag.Duration("batch-timeout", 500*time.Millisecond, "Maximum time to wait for a batch to fill")
+
+	// Locality-aware scheduling parameters
+	dirReportInterval := flag.Duration("dir-report-interval", 5*time.Minute, "Interval for reporting directory statistics")
+	maxDirsTracked := flag.Int("max-dirs-tracked", 100, "Maximum number of directories to track per worker")
+
 	flag.Parse()
 
 	// Validate command mode
@@ -45,7 +54,7 @@ func main() {
 
 	if *compilerMode {
 		// Launcher/compiler mode - distributes compilation jobs
-		compiler := compiler.NewCompilerLauncher(*fsMount, *serverAddr, *buildDir)
+		compiler := compiler.NewCompilerLauncher(*fsMount, *serverAddr, *buildDir, *batchSize, *batchTimeout)
 
 		if err := compiler.Connect(); err != nil {
 			log.Fatalf("Failed to connect to server: %v", err)
@@ -58,7 +67,7 @@ func main() {
 		for i, arg := range os.Args {
 			if arg == "--" && i+1 < len(os.Args) {
 				// We found the separator, pass all remaining args excluding the "--" separator
-				compilerCmd = os.Args[i+1:] 
+				compilerCmd = os.Args[i+1:]
 				separatorFound = true
 				break
 			}
@@ -73,7 +82,7 @@ func main() {
 		}
 	} else if *linkerMode {
 		// Linker launcher mode - distributes linking jobs
-		linker := compiler.NewLinkerLauncher(*fsMount, *serverAddr, *buildDir)
+		linker := compiler.NewLinkerLauncher(*fsMount, *serverAddr, *buildDir, *batchSize, *batchTimeout)
 
 		if err := linker.Connect(); err != nil {
 			log.Fatalf("Failed to connect to server: %v", err)
@@ -86,7 +95,7 @@ func main() {
 		for i, arg := range os.Args {
 			if arg == "--" && i+1 < len(os.Args) {
 				// We found the separator, pass all remaining args excluding the "--" separator
-				linkerCmd = os.Args[i+1:] 
+				linkerCmd = os.Args[i+1:]
 				separatorFound = true
 				break
 			}
@@ -118,6 +127,9 @@ func main() {
 	} else if *workerMode {
 		// Worker mode - processes build jobs
 		w := worker.NewWorker(*serverAddr, *fsMount, int32(*maxJobs))
+
+		// Set directory tracking parameters
+		w.SetDirectoryTrackingParams(*maxDirsTracked, *dirReportInterval)
 
 		// Set linking capabilities based on flag
 		if *disableLinking {

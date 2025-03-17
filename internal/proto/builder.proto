@@ -18,6 +18,13 @@ service BuildService {
 
   // Get the status of a job
   rpc GetJobStatus(JobStatusRequest) returns (JobStatusResponse) {}
+  
+  // Batch RPCs for client-server job batching
+  rpc SubmitBatchCompileJobs(BatchCompileJobRequest) returns (BatchCompileJobResponse) {}
+  rpc SubmitBatchLinkJobs(BatchLinkJobRequest) returns (BatchLinkJobResponse) {}
+  
+  // Directory update for locality-aware scheduling
+  rpc UpdateDirectories(DirectoryUpdateRequest) returns (DirectoryUpdateResponse) {}
 }
 
 // JobRequest is a union type for all job types
@@ -67,6 +74,7 @@ message WorkerRegistration {
   repeated string supported_linkers = 4;  // Linkers this worker supports
   bool supports_linking = 5;              // Whether this worker can handle link jobs
   int32 memory_mb = 6;                    // Available memory (useful for large link jobs)
+  repeated string recent_directories = 7;  // Directories of recently processed files
 }
 
 message JobStatusReport {
@@ -89,4 +97,29 @@ message JobStatusResponse {
   string worker_id = 4;
   int64 elapsed_time_ms = 5;
   bool is_link_job = 6;
+}
+
+message BatchCompileJobRequest {
+  repeated CompileJobRequest jobs = 1;
+}
+
+message BatchCompileJobResponse {
+  repeated CompileJobResponse responses = 1;
+}
+
+message BatchLinkJobRequest {
+  repeated LinkJobRequest jobs = 1;
+}
+
+message BatchLinkJobResponse {
+  repeated LinkJobResponse responses = 1;
+}
+
+message DirectoryUpdateRequest {
+  string worker_id = 1;
+  repeated string directories = 2;
+}
+
+message DirectoryUpdateResponse {
+  bool success = 1;
 }

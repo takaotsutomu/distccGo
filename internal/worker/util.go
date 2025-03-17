@@ -9,7 +9,7 @@ import (
 )
 
 // GetAvailableCompilers finds installed compilers on the system
-func GetAvailableCompilers() []string {
+func getAvailableCompilers() []string {
 	compilers := []string{}
 
 	// List of common compilers to check
@@ -34,7 +34,7 @@ func GetAvailableCompilers() []string {
 }
 
 // GetAvailableLinkers finds installed linkers on the system
-func GetAvailableLinkers() []string {
+func getAvailableLinkers() []string {
 	linkers := []string{}
 
 	// List of common linkers to check
@@ -59,7 +59,7 @@ func GetAvailableLinkers() []string {
 }
 
 // GetAvailableMemory reads system memory information on Linux
-func GetAvailableMemory() int32 {
+func getAvailableMemory() int32 {
 	// Default if Getion fails
 	defaultMemoryMB := int32(4096)
 

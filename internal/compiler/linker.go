@@ -6,6 +6,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,15 +22,41 @@ type LinkerLauncher struct {
 	buildDir      string
 	client        pb.BuildServiceClient
 	conn          *grpc.ClientConn
+
+	// Fields for job batching
+	batchSize     int
+	batchTimeout  time.Duration
+	jobQueue      []*pb.LinkJobRequest
+	jobQueueMutex sync.Mutex
+	batchTimer    *time.Timer
+	jobWaitGroup  sync.WaitGroup
+
+	// Map to track job status and results
+	jobResults     map[string]jobResult
+	jobResultsLock sync.Mutex
 }
 
 // NewLinkerLauncher creates a new launcher instance for linking
-func NewLinkerLauncher(fsMount, serverAddr, buildDir string) *LinkerLauncher {
-	return &LinkerLauncher{
+func NewLinkerLauncher(fsMount, serverAddr, buildDir string, batchSize int, batchTimeout time.Duration) *LinkerLauncher {
+	l := &LinkerLauncher{
 		fsMountPoint:  fsMount,
 		serverAddress: serverAddr,
 		buildDir:      buildDir,
+		batchSize:     batchSize,
+		batchTimeout:  batchTimeout,
+		jobQueue:      make([]*pb.LinkJobRequest, 0, batchSize),
+		jobResults:    make(map[string]jobResult),
 	}
+
+	// Only create timer if batching is enabled
+	if batchSize > 1 {
+		l.batchTimer = time.AfterFunc(batchTimeout, func() {
+			l.flushJobs()
+		})
+		l.batchTimer.Stop() // Don't start yet
+	}
+
+	return l
 }
 
 // Connect establishes a connection to the build server
@@ -44,8 +71,15 @@ func (l *LinkerLauncher) Connect() error {
 	return nil
 }
 
-// Close closes the connection to the server
+// Close closes the connection to the server and flushes any queued jobs
 func (l *LinkerLauncher) Close() error {
+	// Flush any queued jobs
+	if l.batchSize > 1 {
+		if err := l.flushJobs(); err != nil {
+			log.Printf("Error flushing link jobs: %v", err)
+		}
+	}
+
 	if l.conn != nil {
 		return l.conn.Close()
 	}
@@ -67,8 +101,47 @@ func (l *LinkerLauncher) HandleLink(args []string) error {
 		return err
 	}
 
-	// Send job to build server and wait for completion
-	return l.submitJob(job)
+	// If batching is disabled, use the original method
+	if l.batchSize <= 1 {
+		return l.submitJob(job)
+	}
+
+	// With batching enabled, add to queue and potentially flush
+	l.jobWaitGroup.Add(1)
+
+	// Register job in results map
+	l.jobResultsLock.Lock()
+	l.jobResults[job.JobId] = jobResult{
+		completed: false,
+		success:   false,
+	}
+	l.jobResultsLock.Unlock()
+
+	defer l.jobWaitGroup.Done()
+
+	// Add job to the queue
+	l.jobQueueMutex.Lock()
+
+	// Start the batch timer when the first job is added
+	if len(l.jobQueue) == 0 && l.batchTimer != nil {
+		l.batchTimer.Reset(l.batchTimeout)
+	}
+
+	l.jobQueue = append(l.jobQueue, job)
+	queueFull := len(l.jobQueue) >= l.batchSize
+
+	if queueFull {
+		// If full, flush immediately (but don't hold the lock while doing so)
+		l.jobQueueMutex.Unlock()
+		if err := l.flushJobs(); err != nil {
+			return fmt.Errorf("failed to flush link jobs: %v", err)
+		}
+	} else {
+		l.jobQueueMutex.Unlock()
+	}
+
+	// Wait for job to be completed
+	return l.waitForJobResult(job.JobId)
 }
 
 // parseArgs parses linker arguments to create a linking job
@@ -162,6 +235,100 @@ func (l *LinkerLauncher) submitJob(job *pb.LinkJobRequest) error {
 	return l.waitForJobCompletion(job.JobId)
 }
 
+// flushJobs sends all queued jobs as a batch
+func (l *LinkerLauncher) flushJobs() error {
+	l.jobQueueMutex.Lock()
+
+	// Stop the timer
+	if l.batchTimer != nil {
+		l.batchTimer.Stop()
+	}
+
+	// If no jobs, nothing to do
+	if len(l.jobQueue) == 0 {
+		l.jobQueueMutex.Unlock()
+		return nil
+	}
+
+	// Get jobs from queue
+	jobs := make([]*pb.LinkJobRequest, len(l.jobQueue))
+	copy(jobs, l.jobQueue)
+	l.jobQueue = l.jobQueue[:0]
+
+	l.jobQueueMutex.Unlock()
+
+	// Submit the batch
+	return l.submitBatchJobs(jobs)
+}
+
+// submitBatchJobs sends a batch of jobs to the server
+func (l *LinkerLauncher) submitBatchJobs(jobs []*pb.LinkJobRequest) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	batchReq := &pb.BatchLinkJobRequest{
+		Jobs: jobs,
+	}
+
+	log.Printf("Submitting batch of %d link jobs", len(jobs))
+
+	resp, err := l.client.SubmitBatchLinkJobs(ctx, batchReq)
+	if err != nil {
+		// Mark all jobs as failed
+		l.jobResultsLock.Lock()
+		for _, job := range jobs {
+			l.jobResults[job.JobId] = jobResult{
+				completed: true,
+				success:   false,
+				errorMsg:  fmt.Sprintf("batch submission failed: %v", err),
+			}
+		}
+		l.jobResultsLock.Unlock()
+
+		return fmt.Errorf("failed to submit batch link jobs: %v", err)
+	}
+
+	// Process responses and update job results
+	for i, jobResp := range resp.Responses {
+		jobId := jobs[i].JobId
+
+		l.jobResultsLock.Lock()
+		if !jobResp.Accepted {
+			// Job was rejected
+			l.jobResults[jobId] = jobResult{
+				completed: true,
+				success:   false,
+				errorMsg:  jobResp.Message,
+			}
+			log.Printf("Link job %s rejected: %s", jobId, jobResp.Message)
+		} else {
+			log.Printf("Link job %s accepted, waiting for completion", jobId)
+			// Start a goroutine to wait for job completion
+			go func(id string) {
+				err := l.waitForJobCompletion(id)
+
+				l.jobResultsLock.Lock()
+				if err != nil {
+					l.jobResults[id] = jobResult{
+						completed: true,
+						success:   false,
+						errorMsg:  err.Error(),
+					}
+				} else {
+					l.jobResults[id] = jobResult{
+						completed: true,
+						success:   true,
+					}
+				}
+				l.jobResultsLock.Unlock()
+			}(jobId)
+		}
+		l.jobResultsLock.Unlock()
+	}
+
+	return nil
+}
+
 // waitForJobCompletion polls the server until the job is complete
 func (l *LinkerLauncher) waitForJobCompletion(jobId string) error {
 	log.Printf("Waiting for link job %s to complete...", jobId)
@@ -193,5 +360,27 @@ func (l *LinkerLauncher) waitForJobCompletion(jobId string) error {
 			cancel()
 			return fmt.Errorf("unknown job status: %s", status.Status)
 		}
+	}
+}
+
+// waitForJobResult waits for a specific job to be completed in the results map
+func (l *LinkerLauncher) waitForJobResult(jobId string) error {
+	for {
+		l.jobResultsLock.Lock()
+		result, ok := l.jobResults[jobId]
+		if ok && result.completed {
+			// Job is done, remove from tracking
+			delete(l.jobResults, jobId)
+			l.jobResultsLock.Unlock()
+
+			if !result.success {
+				return fmt.Errorf(result.errorMsg)
+			}
+			return nil
+		}
+		l.jobResultsLock.Unlock()
+
+		// Wait and check again
+		time.Sleep(100 * time.Millisecond)
 	}
 }

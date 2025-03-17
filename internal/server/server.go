@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,6 +35,10 @@ type BuildServer struct {
 	availableWorkers chan string           // Channel of available worker IDs
 	workers          map[string]workerInfo // Map of worker ID to worker info
 	workersLock      sync.Mutex
+
+	// Directory tracking for locality-aware scheduling
+	dirToWorkers     map[string]map[string]struct{} // map[directory]map[workerID]struct{}
+	dirToWorkersLock sync.RWMutex
 }
 
 type workerInfo struct {
@@ -46,6 +52,7 @@ type workerInfo struct {
 	memoryMB        int32
 	jobStream       pb.BuildService_WorkerStreamServer
 	streamConnected bool
+	recentDirs      []string // Recently processed directories
 }
 
 type jobStatusInfo struct {
@@ -68,6 +75,7 @@ func NewBuildServer() *BuildServer {
 		jobStatus:        make(map[string]jobStatusInfo),
 		compileJobs:      make(map[string]*pb.CompileJobRequest),
 		linkJobs:         make(map[string]*pb.LinkJobRequest),
+		dirToWorkers:     make(map[string]map[string]struct{}),
 	}
 }
 
@@ -165,6 +173,94 @@ func (s *BuildServer) SubmitLinkJob(ctx context.Context, req *pb.LinkJobRequest)
 	}
 }
 
+// Batch job submission handlers
+func (s *BuildServer) SubmitBatchCompileJobs(ctx context.Context, req *pb.BatchCompileJobRequest) (*pb.BatchCompileJobResponse, error) {
+	responses := make([]*pb.CompileJobResponse, 0, len(req.Jobs))
+
+	log.Printf("Received batch of %d compilation jobs", len(req.Jobs))
+
+	for _, job := range req.Jobs {
+		resp, err := s.SubmitCompileJob(ctx, job)
+		if err != nil {
+			// Create failure response
+			responses = append(responses, &pb.CompileJobResponse{
+				JobId:    job.JobId,
+				Accepted: false,
+				Message:  fmt.Sprintf("Failed to submit job: %v", err),
+			})
+		} else {
+			responses = append(responses, resp)
+		}
+	}
+
+	return &pb.BatchCompileJobResponse{
+		Responses: responses,
+	}, nil
+}
+
+func (s *BuildServer) SubmitBatchLinkJobs(ctx context.Context, req *pb.BatchLinkJobRequest) (*pb.BatchLinkJobResponse, error) {
+	responses := make([]*pb.LinkJobResponse, 0, len(req.Jobs))
+
+	log.Printf("Received batch of %d linking jobs", len(req.Jobs))
+
+	for _, job := range req.Jobs {
+		resp, err := s.SubmitLinkJob(ctx, job)
+		if err != nil {
+			// Create failure response
+			responses = append(responses, &pb.LinkJobResponse{
+				JobId:    job.JobId,
+				Accepted: false,
+				Message:  fmt.Sprintf("Failed to submit job: %v", err),
+			})
+		} else {
+			responses = append(responses, resp)
+		}
+	}
+
+	return &pb.BatchLinkJobResponse{
+		Responses: responses,
+	}, nil
+}
+
+// Directory update handler for locality-aware scheduling
+func (s *BuildServer) UpdateDirectories(ctx context.Context, req *pb.DirectoryUpdateRequest) (*pb.DirectoryUpdateResponse, error) {
+	workerId := req.WorkerId
+
+	s.dirToWorkersLock.Lock()
+	defer s.dirToWorkersLock.Unlock()
+
+	// First, remove this worker from all directory mappings
+	for dir, workers := range s.dirToWorkers {
+		delete(workers, workerId)
+
+		// Clean up empty sets
+		if len(workers) == 0 {
+			delete(s.dirToWorkers, dir)
+		}
+	}
+
+	// Add worker to new directory mappings
+	for _, dir := range req.Directories {
+		workers, exists := s.dirToWorkers[dir]
+		if !exists {
+			workers = make(map[string]struct{})
+			s.dirToWorkers[dir] = workers
+		}
+		workers[workerId] = struct{}{}
+	}
+
+	// Update worker's directory list
+	s.workersLock.Lock()
+	if worker, exists := s.workers[workerId]; exists {
+		// Just store the list of directories
+		worker.recentDirs = req.Directories
+		s.workers[workerId] = worker
+	}
+	s.workersLock.Unlock()
+
+	return &pb.DirectoryUpdateResponse{Success: true}, nil
+}
+
 // WorkerStream establishes a stream with a worker for receiving jobs
 func (s *BuildServer) WorkerStream(reg *pb.WorkerRegistration, stream pb.BuildService_WorkerStreamServer) error {
 	// Register worker
@@ -186,8 +282,23 @@ func (s *BuildServer) WorkerStream(reg *pb.WorkerRegistration, stream pb.BuildSe
 		memoryMB:        reg.MemoryMb,
 		jobStream:       stream,
 		streamConnected: true,
+		recentDirs:      reg.RecentDirectories,
 	}
 	s.workersLock.Unlock()
+
+	// Register directories for locality-aware scheduling if provided
+	if len(reg.RecentDirectories) > 0 {
+		s.dirToWorkersLock.Lock()
+		for _, dir := range reg.RecentDirectories {
+			workers, exists := s.dirToWorkers[dir]
+			if !exists {
+				workers = make(map[string]struct{})
+				s.dirToWorkers[dir] = workers
+			}
+			workers[workerId] = struct{}{}
+		}
+		s.dirToWorkersLock.Unlock()
+	}
 
 	// Signal worker availability - use non-blocking send
 	select {
@@ -198,8 +309,8 @@ func (s *BuildServer) WorkerStream(reg *pb.WorkerRegistration, stream pb.BuildSe
 		// Continue anyway, the worker health check will retry
 	}
 
-	log.Printf("Worker connected: %s (max jobs: %d, linking: %v)",
-		workerId, reg.MaxJobs, reg.SupportsLinking)
+	log.Printf("Worker connected: %s (max jobs: %d, linking: %v, dirs: %d)",
+		workerId, reg.MaxJobs, reg.SupportsLinking, len(reg.RecentDirectories))
 
 	// Keep checking if the worker is still connected
 	for {
@@ -460,7 +571,97 @@ func (s *BuildServer) GetJobStatus(ctx context.Context, req *pb.JobStatusRequest
 	}, nil
 }
 
-// StartScheduler starts the job scheduler routine
+// Helper to extract directories from job for locality-aware scheduling
+func getJobDirectories(jobReq *pb.JobRequest) []string {
+	var dirs []string
+
+	switch job := jobReq.Job.(type) {
+	case *pb.JobRequest_CompileJob:
+		if job.CompileJob.SourceFile != "" {
+			dirs = append(dirs, filepath.Dir(job.CompileJob.SourceFile))
+		}
+		if job.CompileJob.OutputFile != "" {
+			dirs = append(dirs, filepath.Dir(job.CompileJob.OutputFile))
+		}
+		if job.CompileJob.WorkingDir != "" {
+			dirs = append(dirs, job.CompileJob.WorkingDir)
+		}
+	case *pb.JobRequest_LinkJob:
+		if job.LinkJob.OutputFile != "" {
+			dirs = append(dirs, filepath.Dir(job.LinkJob.OutputFile))
+		}
+		if job.LinkJob.WorkingDir != "" {
+			dirs = append(dirs, job.LinkJob.WorkingDir)
+		}
+		for _, input := range job.LinkJob.InputFiles {
+			dirs = append(dirs, filepath.Dir(input))
+		}
+	}
+
+	// Remove duplicates
+	uniqueDirs := make(map[string]struct{})
+	for _, dir := range dirs {
+		uniqueDirs[dir] = struct{}{}
+	}
+
+	result := make([]string, 0, len(uniqueDirs))
+	for dir := range uniqueDirs {
+		result = append(result, dir)
+	}
+
+	return result
+}
+
+// findWorkersWithLocalityPreference returns workers sorted by locality preference
+func (s *BuildServer) findWorkersWithLocalityPreference(dirs []string) []string {
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	s.dirToWorkersLock.RLock()
+	defer s.dirToWorkersLock.RUnlock()
+
+	// Count worker occurrences across directories
+	workerCounts := make(map[string]int)
+
+	for _, dir := range dirs {
+		if workers, exists := s.dirToWorkers[dir]; exists {
+			for workerID := range workers {
+				workerCounts[workerID]++
+			}
+		}
+	}
+
+	if len(workerCounts) == 0 {
+		return nil
+	}
+
+	// Sort workers by locality score (most matching directories first)
+	type workerScore struct {
+		id    string
+		score int
+	}
+
+	scores := make([]workerScore, 0, len(workerCounts))
+	for id, count := range workerCounts {
+		scores = append(scores, workerScore{id, count})
+	}
+
+	// Sort by score descending
+	sort.Slice(scores, func(i, j int) bool {
+		return scores[i].score > scores[j].score
+	})
+
+	// Extract worker IDs in order
+	result := make([]string, len(scores))
+	for i, ws := range scores {
+		result[i] = ws.id
+	}
+
+	return result
+}
+
+// StartScheduler starts the job scheduler routine with locality-aware scheduling
 func (s *BuildServer) StartScheduler() {
 	go func() {
 		for jobReq := range s.pendingJobs {
@@ -509,34 +710,64 @@ func (s *BuildServer) StartScheduler() {
 			if isLinkJob {
 				selectedWorker = s.findLinkCapableWorker()
 			} else {
-				// Try to get any available worker from the channel with a timeout
-				select {
-				case selectedWorker = <-s.availableWorkers:
-					// Got a worker
-					log.Printf("Found available worker %s for job %s", selectedWorker, jobId)
-				case <-time.After(500 * time.Millisecond):
-					// Timeout, no worker available
-					log.Printf("No available worker for job %s, requeueing", jobId)
+				// Use locality-aware scheduling for compilation jobs
+				dirs := getJobDirectories(jobReq)
+				localityWorkers := s.findWorkersWithLocalityPreference(dirs)
 
-					// Requeue the job with a small delay to avoid tight loops
-					go func(req *pb.JobRequest) {
-						time.Sleep(1 * time.Second)
-						select {
-						case s.pendingJobs <- req:
-							// Successfully requeued
-						default:
-							log.Printf("WARNING: Could not requeue job %s (channel full)", jobId)
-							// Try one more time with longer delay
-							time.Sleep(2 * time.Second)
+				// Try to use locality-preferred workers
+				if len(localityWorkers) > 0 {
+					for _, workerId := range localityWorkers {
+						s.workersLock.Lock()
+						worker, exists := s.workers[workerId]
+						if exists && worker.streamConnected && worker.activeJobs < worker.maxJobs {
+							// Found a suitable worker with locality preference
+							worker.activeJobs++
+							s.workers[workerId] = worker
+							selectedWorker = workerId
+							s.workersLock.Unlock()
+
+							log.Printf("Using locality-preferred worker %s for job %s", workerId, jobId)
+							break
+						}
+						s.workersLock.Unlock()
+					}
+				}
+
+				// If no locality-preferred worker found, try to get any available worker from the channel
+				if selectedWorker == "" {
+					select {
+					case selectedWorker = <-s.availableWorkers:
+						// Got a worker from the channel
+						s.workersLock.Lock()
+						worker := s.workers[selectedWorker]
+						worker.activeJobs++
+						s.workers[selectedWorker] = worker
+						s.workersLock.Unlock()
+						log.Printf("Found available worker %s for job %s (no locality preference)", selectedWorker, jobId)
+					case <-time.After(500 * time.Millisecond):
+						// Timeout, no worker available
+						log.Printf("No available worker for job %s, requeueing", jobId)
+
+						// Requeue the job with a small delay to avoid tight loops
+						go func(req *pb.JobRequest) {
+							time.Sleep(1 * time.Second)
 							select {
 							case s.pendingJobs <- req:
-								// Successfully requeued on second attempt
+								// Successfully requeued
 							default:
-								log.Printf("ERROR: Failed to requeue job %s after retry, job may be lost", jobId)
+								log.Printf("WARNING: Could not requeue job %s (channel full)", jobId)
+								// Try one more time with longer delay
+								time.Sleep(2 * time.Second)
+								select {
+								case s.pendingJobs <- req:
+									// Successfully requeued on second attempt
+								default:
+									log.Printf("ERROR: Failed to requeue job %s after retry, job may be lost", jobId)
+								}
 							}
-						}
-					}(jobReq)
-					continue
+						}(jobReq)
+						continue
+					}
 				}
 			}
 
@@ -555,7 +786,7 @@ func (s *BuildServer) StartScheduler() {
 				continue
 			}
 
-			// Check if the selected worker is still available
+			// Double-check the selected worker is still available (might have changed since we checked for locality)
 			s.workersLock.Lock()
 			worker, exists := s.workers[selectedWorker]
 			if !exists || !worker.streamConnected {
@@ -577,7 +808,11 @@ func (s *BuildServer) StartScheduler() {
 			// For link jobs, make sure worker supports linking
 			if isLinkJob && !worker.supportsLinking {
 				// Worker doesn't support linking, put job back and try another worker
+				// Decrease the active job count since we're not going to use this worker
+				worker.activeJobs--
+				s.workers[selectedWorker] = worker
 				s.workersLock.Unlock()
+
 				log.Printf("Worker %s doesn't support linking, requeueing job %s", selectedWorker, jobId)
 				go func(req *pb.JobRequest) {
 					time.Sleep(500 * time.Millisecond)
@@ -591,11 +826,10 @@ func (s *BuildServer) StartScheduler() {
 				continue
 			}
 
-			// Update worker and job status
-			worker.activeJobs++
-			s.workers[selectedWorker] = worker
+			// At this point we have a worker whose activeJobs has already been incremented
 			s.workersLock.Unlock()
 
+			// Update job status
 			s.jobStatusLock.Lock()
 			jobInfo.status = "assigned"
 			jobInfo.worker = selectedWorker
@@ -673,6 +907,8 @@ func (s *BuildServer) findLinkCapableWorker() string {
 		worker, exists := s.workers[workerId]
 		if exists && worker.streamConnected && worker.supportsLinking {
 			log.Printf("Found linking-capable worker %s from available queue", workerId)
+			worker.activeJobs++
+			s.workers[workerId] = worker
 			return workerId
 		}
 
@@ -704,6 +940,9 @@ func (s *BuildServer) findLinkCapableWorker() string {
 
 		if bestWorker != "" {
 			log.Printf("Found linking-capable worker %s with %d MB memory", bestWorker, bestMemory)
+			worker = s.workers[bestWorker]
+			worker.activeJobs++
+			s.workers[bestWorker] = worker
 		}
 		return bestWorker
 
@@ -727,6 +966,9 @@ func (s *BuildServer) findLinkCapableWorker() string {
 
 		if bestWorker != "" {
 			log.Printf("Found linking-capable worker %s with %d MB memory (after timeout)", bestWorker, bestMemory)
+			worker := s.workers[bestWorker]
+			worker.activeJobs++
+			s.workers[bestWorker] = worker
 		} else {
 			log.Printf("No linking-capable workers available with capacity")
 		}

@@ -19,11 +19,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	BuildService_SubmitCompileJob_FullMethodName = "/builder.BuildService/SubmitCompileJob"
-	BuildService_SubmitLinkJob_FullMethodName    = "/builder.BuildService/SubmitLinkJob"
-	BuildService_WorkerStream_FullMethodName     = "/builder.BuildService/WorkerStream"
-	BuildService_ReportJobStatus_FullMethodName  = "/builder.BuildService/ReportJobStatus"
-	BuildService_GetJobStatus_FullMethodName     = "/builder.BuildService/GetJobStatus"
+	BuildService_SubmitCompileJob_FullMethodName       = "/builder.BuildService/SubmitCompileJob"
+	BuildService_SubmitLinkJob_FullMethodName          = "/builder.BuildService/SubmitLinkJob"
+	BuildService_WorkerStream_FullMethodName           = "/builder.BuildService/WorkerStream"
+	BuildService_ReportJobStatus_FullMethodName        = "/builder.BuildService/ReportJobStatus"
+	BuildService_GetJobStatus_FullMethodName           = "/builder.BuildService/GetJobStatus"
+	BuildService_SubmitBatchCompileJobs_FullMethodName = "/builder.BuildService/SubmitBatchCompileJobs"
+	BuildService_SubmitBatchLinkJobs_FullMethodName    = "/builder.BuildService/SubmitBatchLinkJobs"
+	BuildService_UpdateDirectories_FullMethodName      = "/builder.BuildService/UpdateDirectories"
 )
 
 // BuildServiceClient is the client API for BuildService service.
@@ -40,6 +43,11 @@ type BuildServiceClient interface {
 	ReportJobStatus(ctx context.Context, in *JobStatusReport, opts ...grpc.CallOption) (*JobStatusAck, error)
 	// Get the status of a job
 	GetJobStatus(ctx context.Context, in *JobStatusRequest, opts ...grpc.CallOption) (*JobStatusResponse, error)
+	// Batch RPCs for client-server job batching
+	SubmitBatchCompileJobs(ctx context.Context, in *BatchCompileJobRequest, opts ...grpc.CallOption) (*BatchCompileJobResponse, error)
+	SubmitBatchLinkJobs(ctx context.Context, in *BatchLinkJobRequest, opts ...grpc.CallOption) (*BatchLinkJobResponse, error)
+	// Directory update for locality-aware scheduling
+	UpdateDirectories(ctx context.Context, in *DirectoryUpdateRequest, opts ...grpc.CallOption) (*DirectoryUpdateResponse, error)
 }
 
 type buildServiceClient struct {
@@ -109,6 +117,36 @@ func (c *buildServiceClient) GetJobStatus(ctx context.Context, in *JobStatusRequ
 	return out, nil
 }
 
+func (c *buildServiceClient) SubmitBatchCompileJobs(ctx context.Context, in *BatchCompileJobRequest, opts ...grpc.CallOption) (*BatchCompileJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchCompileJobResponse)
+	err := c.cc.Invoke(ctx, BuildService_SubmitBatchCompileJobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) SubmitBatchLinkJobs(ctx context.Context, in *BatchLinkJobRequest, opts ...grpc.CallOption) (*BatchLinkJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchLinkJobResponse)
+	err := c.cc.Invoke(ctx, BuildService_SubmitBatchLinkJobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) UpdateDirectories(ctx context.Context, in *DirectoryUpdateRequest, opts ...grpc.CallOption) (*DirectoryUpdateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DirectoryUpdateResponse)
+	err := c.cc.Invoke(ctx, BuildService_UpdateDirectories_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // BuildServiceServer is the server API for BuildService service.
 // All implementations must embed UnimplementedBuildServiceServer
 // for forward compatibility.
@@ -123,6 +161,11 @@ type BuildServiceServer interface {
 	ReportJobStatus(context.Context, *JobStatusReport) (*JobStatusAck, error)
 	// Get the status of a job
 	GetJobStatus(context.Context, *JobStatusRequest) (*JobStatusResponse, error)
+	// Batch RPCs for client-server job batching
+	SubmitBatchCompileJobs(context.Context, *BatchCompileJobRequest) (*BatchCompileJobResponse, error)
+	SubmitBatchLinkJobs(context.Context, *BatchLinkJobRequest) (*BatchLinkJobResponse, error)
+	// Directory update for locality-aware scheduling
+	UpdateDirectories(context.Context, *DirectoryUpdateRequest) (*DirectoryUpdateResponse, error)
 	mustEmbedUnimplementedBuildServiceServer()
 }
 
@@ -147,6 +190,15 @@ func (UnimplementedBuildServiceServer) ReportJobStatus(context.Context, *JobStat
 }
 func (UnimplementedBuildServiceServer) GetJobStatus(context.Context, *JobStatusRequest) (*JobStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetJobStatus not implemented")
+}
+func (UnimplementedBuildServiceServer) SubmitBatchCompileJobs(context.Context, *BatchCompileJobRequest) (*BatchCompileJobResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SubmitBatchCompileJobs not implemented")
+}
+func (UnimplementedBuildServiceServer) SubmitBatchLinkJobs(context.Context, *BatchLinkJobRequest) (*BatchLinkJobResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SubmitBatchLinkJobs not implemented")
+}
+func (UnimplementedBuildServiceServer) UpdateDirectories(context.Context, *DirectoryUpdateRequest) (*DirectoryUpdateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateDirectories not implemented")
 }
 func (UnimplementedBuildServiceServer) mustEmbedUnimplementedBuildServiceServer() {}
 func (UnimplementedBuildServiceServer) testEmbeddedByValue()                      {}
@@ -252,6 +304,60 @@ func _BuildService_GetJobStatus_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BuildService_SubmitBatchCompileJobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchCompileJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).SubmitBatchCompileJobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_SubmitBatchCompileJobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).SubmitBatchCompileJobs(ctx, req.(*BatchCompileJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_SubmitBatchLinkJobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchLinkJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).SubmitBatchLinkJobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_SubmitBatchLinkJobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).SubmitBatchLinkJobs(ctx, req.(*BatchLinkJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_UpdateDirectories_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DirectoryUpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).UpdateDirectories(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_UpdateDirectories_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).UpdateDirectories(ctx, req.(*DirectoryUpdateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // BuildService_ServiceDesc is the grpc.ServiceDesc for BuildService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -274,6 +380,18 @@ var BuildService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetJobStatus",
 			Handler:    _BuildService_GetJobStatus_Handler,
+		},
+		{
+			MethodName: "SubmitBatchCompileJobs",
+			Handler:    _BuildService_SubmitBatchCompileJobs_Handler,
+		},
+		{
+			MethodName: "SubmitBatchLinkJobs",
+			Handler:    _BuildService_SubmitBatchLinkJobs_Handler,
+		},
+		{
+			MethodName: "UpdateDirectories",
+			Handler:    _BuildService_UpdateDirectories_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
